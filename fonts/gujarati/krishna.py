@@ -81,6 +81,46 @@ class Krishna(BaseFont):
        before the text is tokenized rather than carried through the passes
        as a token that converts to nothing.
 
+       TWO NAMES FOR ONE BYTE
+
+       The glyphs of an 8 bit font carry the names of whatever characters
+       live on their bytes in a latin table, and the producers behind this
+       gazette chose two such tables. Most of its pdfs name the glyphs the
+       windows way, and their text extracts as the cp1252 characters of the
+       bytes - જિલ્લા as "ìÉSáë". The pdfs of the older issues, and of a good
+       many recent ones, name the same glyphs the macroman way, so that the
+       same bytes extract as "Ï…S·Î": 0xEC is ì under one table and Ï under
+       the other, 0xC9 É and …, 0xE1 á and ·, 0xEB ë and Î. Every face of
+       the layout is carried both ways - Krishna, KrishnaBold, Krishnaextra,
+       Suchitra, Mani12, Giridhar, Mohan and Chitra all turn up in either -
+       and the glyphs are the same glyphs whichever way they are named.
+
+       So the table below is the bytes, written as the cp1252 characters
+       they extract as, and a lexer is built for each of the two tables
+       over the characters those bytes extract as under it. pick_lexer()
+       picks between them per run of text, by how many of the run's
+       characters each table has a glyph for, the way fonts/kannada/
+       aklite.py does: the characters the two tables share are the ascii
+       ones, which count the same for both, and the ones the other table
+       reads as something else entirely (Î is ફ in one and ા in the other)
+       count for both as well, so it is the characters only one of them has
+       a glyph for - ﬁ ‹ ı ˘ against Þ Ü õ ë - that decide. A run the two
+       read equally well, which can only be one with nothing of this font
+       in it, is read the windows way, as it always was.
+
+       Four bytes do not come out of the macroman pdfs as python's
+       mac_roman table says they should, the names the pdfs give them
+       being the ones of the older Apple table that pdfminer and pymupdf
+       both follow: 0xDB is ¤ (the currency sign, which Apple later
+       replaced with the euro), 0xBD is Ω the ohm sign rather than the
+       greek capital omega, 0xB5 is μ the greek small mu rather than the
+       micro sign, and 0xF0, the apple logo, comes out as U+E0F0. Those are
+       MAC_ROMAN_ALIASES, read as the bytes they stand for beside python's
+       own reading of them. The spacers are dropped by their byte too, so
+       a macroman run drops ≠ and Ô where a windows one drops 0xAD and ï -
+       and Ô is ધ in the windows table, which is why the spacers are only
+       dropped once the run's table is known.
+
        THE ENGLISH IN THE MIDDLE OF A GUJARATI LINE
 
        The gazette sets the odd english word inside a gujarati line - a
@@ -117,6 +157,24 @@ class Krishna(BaseFont):
     # comment. Neither is a character, so they never reach the tokenizer
     SPACERS = '\xad\xef'
 
+    # the two tables a pdf names the glyphs of an 8 bit font by, and so the
+    # two ways its text comes back out, see the class comment. The table of
+    # get_lexer() is written in the first of them
+    encodings = ('cp1252', 'mac_roman')
+
+    # the table a run that both of them read equally well is taken to be in,
+    # see pick_lexer()
+    default_encoding = 'cp1252'
+
+    # what the macroman pdfs hand out for the four bytes they do not name the
+    # way python's mac_roman does, see the class comment
+    MAC_ROMAN_ALIASES = {
+        0xB5: ['\u03bc'],
+        0xBD: ['\u2126'],
+        0xDB: ['\xa4'],
+        0xF0: ['\ue0f0'],
+    }
+
     # the vowel signs that carry the upright of the letter they sit on and
     # so complete a half form, ા being the upright by itself
     UPRIGHT_SIGNS = ['MATRA_II', 'MATRA_O', 'MATRA_AU']
@@ -131,7 +189,15 @@ class Krishna(BaseFont):
         self.langobjs.append(gujarati.GujaratiUnicode())
         self.langobjs.append(gujarati.Conjuncts())
 
-        self.lexer = self.get_lexer()
+        # what each glyph of the font extracts as under each of the two
+        # tables, and a lexer over each of those alphabets
+        self.glyphchars = {}
+        self.lexers     = {}
+        for encoding in self.encodings:
+            self.glyphchars[encoding] = set()
+            self.lexers[encoding]     = self.get_lexer(encoding)
+
+        self.lexer = self.lexers[self.default_encoding]
 
         # િ is drawn in front of the cluster it belongs to and is typed
         # there as well
@@ -225,25 +291,88 @@ class Krishna(BaseFont):
                '\u0ae2' <= ustr <= '\u0ae3'
 
     def to_unicode(self, data):
-        return BaseFont.to_unicode(self, self.drop_spacers(data))
+        # a run of text is read under one of the two tables as a whole - a
+        # pdf names the glyphs of a font one way, see pick_lexer()
+        encoding   = self.pick_encoding(data)
+        self.lexer = self.lexers[encoding]
 
-    def drop_spacers(self, data):
-        '''the two bytes that draw nothing and stand for nothing, see the
+        return BaseFont.to_unicode(self, self.drop_spacers(data, encoding))
+
+    def pick_encoding(self, data):
+        '''which of the two tables a run of text is in: the one that has a
+           glyph for more of the run's characters. A run that both of them
+           read equally well is taken to be in default_encoding - see the
            class comment'''
+        def matched(encoding):
+            glyphs = self.glyphchars[encoding]
+            return len([char for char in data if char in glyphs])
+
+        # default_encoding is the one to beat rather than just another
+        # candidate, so that a tie goes to it whichever order
+        # self.encodings happens to list them in
+        best  = self.default_encoding
+        score = matched(best)
+
+        for encoding in self.encodings:
+            if matched(encoding) > score:
+                best  = encoding
+                score = matched(encoding)
+
+        return best
+
+    def pick_lexer(self, data):
+        return self.lexers[self.pick_encoding(data)]
+
+    def get_glyph_strings(self, glyph, encoding):
+        '''what a glyph of the table of get_lexer(), which is written as the
+           cp1252 character of its byte, extracts as under this table. 0x8D
+           is a byte cp1252 leaves undefined and that a pdf hands out as
+           the latin-1 character of it, so that is the byte it is read as'''
+        if encoding == self.default_encoding:
+            return [glyph]
+
+        try:
+            code = glyph.encode('cp1252')
+        except UnicodeEncodeError:
+            code = glyph.encode('latin-1')
+
+        strings = [code.decode(encoding)]
+        if encoding == 'mac_roman' and len(code) == 1:
+            strings.extend(self.MAC_ROMAN_ALIASES.get(code[0], []))
+        return strings
+
+    def drop_spacers(self, data, encoding = None):
+        '''the two bytes that draw nothing and stand for nothing, read under
+           the table the run is in, see the class comment'''
+        if encoding == None:
+            encoding = self.default_encoding
+
         for spacer in self.SPACERS:
-            data = data.replace(spacer, '')
+            for char in self.get_glyph_strings(spacer, encoding):
+                data = data.replace(char, '')
         return data
 
-    def get_lexer(self):
+    def get_lexer(self, encoding = None):
+        if encoding == None:
+            encoding = self.default_encoding
+
         tokens = []
         for obj in self.langobjs:
             tokens.extend(obj.get_tokens())
 
+        glyphchars = self.glyphchars.setdefault(encoding, set())
+
         def pat(*glyphs):
-            # token strings are regular expressions for ply, so the glyphs
-            # have to be escaped. Alternate glyphs of the same token are
-            # joined into one pattern
-            return '|'.join([re.escape(glyph) for glyph in glyphs])
+            # the glyphs are written as the cp1252 characters of their bytes
+            # and are read here as what those bytes extract as under the
+            # table of this lexer. Token strings are regular expressions for
+            # ply, so the glyphs have to be escaped. Alternate glyphs of the
+            # same token are joined into one pattern
+            strings = []
+            for glyph in glyphs:
+                strings.extend(self.get_glyph_strings(glyph, encoding))
+            glyphchars.update(strings)
+            return '|'.join([re.escape(string) for string in strings])
 
         # VOWELS. આ, એ, ઐ, ઓ and ઔ are each typed as અ and a vowel sign,
         # see self.composeTokens
